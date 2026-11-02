@@ -92,9 +92,8 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     }
 
     /// 点击屏幕 → 记录一个点（或完成导入点的放置）。
-    /// 命中优先级：① 场景重建网格求交（最准，直接命中真实表面几何）
-    /// ② 射线方向 + LiDAR 深度择优（网格未覆盖时）
-    /// ③ 纯深度反投影（非平面悬空物）→ 都不行提示未命中
+    /// 命中优先级：① 网格求交 + LiDAR 深度交叉验证（防网格空洞穿透到深层）
+    /// ② 射线方向 + 深度择优 ③ 纯深度反投影 → 都不行提示未命中
     @MainActor func handleTap(at screenPoint: CGPoint) {
         guard let view = arView, let frame = view.session.currentFrame else { return }
         let viewSize = view.bounds.size
@@ -102,18 +101,7 @@ final class MeasureSessionManager: NSObject, ObservableObject {
 
         let cam = frame.camera.transform.columns.3
         let camXYZ = SIMD3<Float>(cam.x, cam.y, cam.z)
-
-        // ① 网格求交
-        if let dir = screenRayDirection(screenPoint, frame: frame, view: view),
-           let meshHit = nearestMeshHit(origin: camXYZ, direction: dir, frame: frame) {
-            // 沿视线方向退 1.5cm，避免小球和重建网格贴面闪烁
-            let p = meshHit.point - dir * 0.015
-            place(at: translationMatrix(p))
-            diagMessage = "🎯 网格\(String(format: "%.2f", meshHit.distance))m"
-            return
-        }
-
-        let rayResult = raycast(in: view, at: screenPoint)
+        let rayDir = screenRayDirection(screenPoint, frame: frame, view: view)
 
         // 图像归一化坐标（供深度读取用）
         var captureCoord: CGPoint?
@@ -125,6 +113,25 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             captureCoord = n.applying(toCapture)
         }
 
+        // ① 网格求交 + 深度交叉验证
+        if let dir = rayDir, let meshHit = nearestMeshHit(origin: camXYZ, direction: dir, frame: frame) {
+            if let c = captureCoord, let map = depthMap,
+               let depth = nearestCandidateDepth(c, map, reference: meshHit.distance),
+               abs(depth - meshHit.distance) > 0.5 {
+                // 网格命中与真实表面深度差太大：网格有洞，射线穿到了深层（如下一层楼板）→ 用深度
+                let p = camXYZ + dir * (depth - 0.015)
+                place(at: translationMatrix(p))
+                diagMessage = "🎯 深度\(String(format: "%.2f", depth))m(防网格穿透)"
+            } else {
+                let p = meshHit.point - dir * 0.015
+                place(at: translationMatrix(p))
+                diagMessage = "🎯 网格\(String(format: "%.2f", meshHit.distance))m"
+            }
+            return
+        }
+
+        let rayResult = raycast(in: view, at: screenPoint)
+
         let hitTransform: simd_float4x4
 
         if let result = rayResult {
@@ -133,26 +140,14 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             let hitXYZ = SIMD3<Float>(hit.x, hit.y, hit.z)
             let rayDist = simd_distance(camXYZ, hitXYZ)
 
-            if let c = captureCoord, let map = depthMap {
-                // 4 种映射候选，取与射线距离最接近的深度
-                let candidates = [
-                    CGPoint(x: c.x, y: c.y),
-                    CGPoint(x: 1 - c.x, y: c.y),
-                    CGPoint(x: c.x, y: 1 - c.y),
-                    CGPoint(x: 1 - c.x, y: 1 - c.y),
-                ].compactMap { readDepth($0, map) }
-
-                if let best = candidates.min(by: { abs($0 - rayDist) < abs($1 - rayDist) }),
-                   abs(best - rayDist) < 1.2 {
-                    let dir = (hitXYZ - camXYZ) / rayDist
-                    let surface = camXYZ + dir * (best - 0.015)
-                    transform = translationMatrix(surface)
-                    diagMessage = "🎯 表面\(String(format: "%.2f", best))m(网格未覆盖)"
-                } else {
-                    diagMessage = "🎯 平面\(String(format: "%.2f", rayDist))m"
-                }
+            if let c = captureCoord, let map = depthMap,
+               let best = nearestCandidateDepth(c, map, reference: rayDist),
+               abs(best - rayDist) < 1.2 {
+                let dir = (hitXYZ - camXYZ) / rayDist
+                transform = translationMatrix(camXYZ + dir * (best - 0.015))
+                diagMessage = "🎯 表面\(String(format: "%.2f", best))m(网格未覆盖)"
             } else {
-                diagMessage = "🎯 平面\(String(format: "%.2f", simd_distance(camXYZ, SIMD3<Float>(hit.x, hit.y, hit.z))))m 无深度"
+                diagMessage = "🎯 平面\(String(format: "%.2f", rayDist))m"
             }
             hitTransform = transform
         } else if let c = captureCoord, let map = depthMap,
@@ -181,6 +176,17 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         var t = matrix_identity_float4x4
         t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
         return t
+    }
+
+    /// 4 种坐标映射候选中，取与参考距离最接近的深度值（返回 nil 表示无有效深度）
+    private func nearestCandidateDepth(_ c: CGPoint, _ map: CVPixelBuffer, reference: Float) -> Float? {
+        let candidates = [
+            CGPoint(x: c.x, y: c.y),
+            CGPoint(x: 1 - c.x, y: c.y),
+            CGPoint(x: c.x, y: 1 - c.y),
+            CGPoint(x: 1 - c.x, y: 1 - c.y),
+        ].compactMap { readDepth($0, map) }
+        return candidates.min(by: { abs($0 - reference) < abs($1 - reference) })
     }
 
     /// 屏幕点击位置对应的世界空间射线方向。
