@@ -70,9 +70,12 @@ final class MeasureSessionManager: NSObject, ObservableObject {
 
     private func startSession() {
         guard let view = arView else { return }
-        // 最低负载配置：只开平面检测（sceneReconstruction/environmentTexturing 对本 App 无用）
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal, .vertical]
+        // LiDAR 深度：用于把点击点精确贴到真实物体表面
+        if ARWorldTrackingConfiguration.supportsFrameSemantics([.sceneDepth]) {
+            config.frameSemantics = [.sceneDepth]
+        }
         view.session.run(config)
     }
 
@@ -80,25 +83,94 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     @MainActor func handleTap(at screenPoint: CGPoint) {
         guard let view = arView else { return }
         if let result = raycast(in: view, at: screenPoint) {
+            // LiDAR 深度校准：把命中点拉到真实物体表面
+            let transform = refinedSurfaceTransform(for: result, at: screenPoint, in: view)
             if let pending = pendingPlacement {
                 pendingPlacement = nil
-                placeImported(pending, at: result.worldTransform)
+                placeImported(pending, at: transform)
             } else {
-                addPoint(worldTransform: result.worldTransform)
+                addPoint(worldTransform: transform)
             }
         } else {
             missNotice = Date()
         }
     }
 
-    /// 依次尝试：已识别平面（含范围）→ 平面无限延伸 → 估算平面
+    /// 已识别平面（含范围）→ 估算平面。
+    /// 不用 existingPlaneInfinite：平面无限延伸会让点"穿过"近处物体落在背景上。
     private func raycast(in view: ARView, at point: CGPoint) -> ARRaycastResult? {
-        for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .existingPlaneInfinite, .estimatedPlane] {
+        for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
             if let result = view.raycast(from: point, allowing: target, alignment: .any).first {
                 return result
             }
         }
         return nil
+    }
+
+    /// 用 LiDAR 深度图校准命中点：深度值就是真实物体表面到相机的距离。
+    /// 射线方向不变、距离替换成深度 → 点贴合物体表面（含非平面物体）。
+    private func refinedSurfaceTransform(for result: ARRaycastResult,
+                                         at screenPoint: CGPoint,
+                                         in view: ARView) -> simd_float4x4 {
+        guard let frame = view.session.currentFrame,
+              let depth = surfaceDepth(at: screenPoint, frame: frame, view: view)
+        else { return result.worldTransform }
+
+        let cam = frame.camera.transform.columns.3
+        let camXYZ = SIMD3<Float>(cam.x, cam.y, cam.z)
+        let hit = result.worldTransform.columns.3
+        let hitXYZ = SIMD3<Float>(hit.x, hit.y, hit.z)
+        let rayDist = simd_distance(camXYZ, hitXYZ)
+
+        // 深度和射线距离差 1 米以上视为读数可疑（可能读到了别处），放弃校准
+        guard abs(rayDist - depth) < 1.0 else { return result.worldTransform }
+
+        let dir = (hitXYZ - camXYZ) / rayDist
+        let surface = camXYZ + dir * depth
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(surface.x, surface.y, surface.z, 1)
+        return t
+    }
+
+    /// 读点击位置附近的 LiDAR 深度（3x3 抽样取中值，抗噪）
+    private func surfaceDepth(at screenPoint: CGPoint, frame: ARFrame, view: ARView) -> Float? {
+        guard let depthMap = frame.sceneDepth?.depthMap else { return nil }
+        let viewSize = view.bounds.size
+        guard viewSize.width > 0, viewSize.height > 0 else { return nil }
+
+        // 屏幕归一化坐标 → 相机图像归一化坐标
+        let toCapture = frame.displayTransform(for: .portrait, viewportSize: viewSize).inverted()
+        let n = CGPoint(x: screenPoint.x / viewSize.width, y: screenPoint.y / viewSize.height)
+        let c = n.applying(toCapture)
+
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+        let w = CVPixelBufferGetWidth(depthMap)
+        let h = CVPixelBufferGetHeight(depthMap)
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(depthMap, 0) else { return nil }
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(depthMap, 0)
+
+        func depthAt(_ nx: CGFloat, _ ny: CGFloat) -> Float? {
+            let x = Int(nx * CGFloat(w)), y = Int(ny * CGFloat(h))
+            guard x >= 1, y >= 1, x < w - 1, y < h - 1 else { return nil }
+            var values: [Float] = []
+            for dy in [-1, 0, 1] {
+                for dx in [-1, 0, 1] {
+                    let px = x + dx, py = y + dy
+                    let raw = base.advanced(by: py * rowBytes + px * MemoryLayout<UInt16>.stride)
+                        .assumingMemoryBound(to: UInt16.self).pointee
+                    let f = Float(Float16(bitPattern: raw))
+                    if f.isFinite, f > 0.05, f < 8 { values.append(f) }
+                }
+            }
+            guard !values.isEmpty else { return nil }
+            values.sort()
+            return values[values.count / 2]
+        }
+
+        // 正常坐标优先；若与预期严重不符，尝试 y 翻转后重读
+        return depthAt(c.x, c.y) ?? depthAt(c.x, 1 - c.y)
     }
 
     @MainActor private func addPoint(worldTransform: simd_float4x4) {
