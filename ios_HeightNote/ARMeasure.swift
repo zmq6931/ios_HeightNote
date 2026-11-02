@@ -18,6 +18,8 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     @Published var referenceElevation: Float?
     /// 导入待放置的点：非空时下一次点击屏幕 = 在现实中指定第一个点的位置
     @Published var pendingPlacement: [MarkedPoint]?
+    /// 点击诊断信息（临时）：显示射线距离与 LiDAR 深度
+    @Published var diagMessage: String?
 
     private(set) weak var arView: ARView?
     private var anchors: [UUID: AnchorEntity] = [:]
@@ -79,20 +81,29 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         view.session.run(config)
     }
 
-    /// 点击屏幕 → 射线打到现实物体 → 记录一个点（或完成导入点的放置）
+    /// 点击屏幕 → 记录一个点（或完成导入点的放置）。
+    /// 优先用 LiDAR 深度反投影：点直接落在点击像素的真实物体表面（含非平面物体）；
+    /// 读不到深度时退回平面 raycast。
     @MainActor func handleTap(at screenPoint: CGPoint) {
-        guard let view = arView else { return }
-        if let result = raycast(in: view, at: screenPoint) {
-            // LiDAR 深度校准：把命中点拉到真实物体表面
-            let transform = refinedSurfaceTransform(for: result, at: screenPoint, in: view)
-            if let pending = pendingPlacement {
-                pendingPlacement = nil
-                placeImported(pending, at: transform)
-            } else {
-                addPoint(worldTransform: transform)
-            }
+        guard let view = arView, let frame = view.session.currentFrame else { return }
+
+        let hitTransform: simd_float4x4
+        if let depthHit = depthHitTransform(at: screenPoint, frame: frame, view: view) {
+            hitTransform = depthHit
+        } else if let result = raycast(in: view, at: screenPoint) {
+            hitTransform = result.worldTransform
+            diagMessage = "🎯 无深度，用平面"
         } else {
             missNotice = Date()
+            diagMessage = "🎯 未命中"
+            return
+        }
+
+        if let pending = pendingPlacement {
+            pendingPlacement = nil
+            placeImported(pending, at: hitTransform)
+        } else {
+            addPoint(worldTransform: hitTransform)
         }
     }
 
@@ -107,42 +118,56 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         return nil
     }
 
-    /// 用 LiDAR 深度图校准命中点：深度值就是真实物体表面到相机的距离。
-    /// 射线方向不变、距离替换成深度 → 点贴合物体表面（含非平面物体）。
-    private func refinedSurfaceTransform(for result: ARRaycastResult,
-                                         at screenPoint: CGPoint,
-                                         in view: ARView) -> simd_float4x4 {
-        guard let frame = view.session.currentFrame,
-              let depth = surfaceDepth(at: screenPoint, frame: frame, view: view)
-        else { return result.worldTransform }
-
-        let cam = frame.camera.transform.columns.3
-        let camXYZ = SIMD3<Float>(cam.x, cam.y, cam.z)
-        let hit = result.worldTransform.columns.3
-        let hitXYZ = SIMD3<Float>(hit.x, hit.y, hit.z)
-        let rayDist = simd_distance(camXYZ, hitXYZ)
-
-        // 深度和射线距离差 1 米以上视为读数可疑（可能读到了别处），放弃校准
-        guard abs(rayDist - depth) < 1.0 else { return result.worldTransform }
-
-        let dir = (hitXYZ - camXYZ) / rayDist
-        let surface = camXYZ + dir * depth
-        var t = matrix_identity_float4x4
-        t.columns.3 = SIMD4<Float>(surface.x, surface.y, surface.z, 1)
-        return t
-    }
-
-    /// 读点击位置附近的 LiDAR 深度（3x3 抽样取中值，抗噪）
-    private func surfaceDepth(at screenPoint: CGPoint, frame: ARFrame, view: ARView) -> Float? {
-        guard let depthMap = frame.sceneDepth?.depthMap else { return nil }
+    /// LiDAR 深度反投影：点击像素 → 该像素处真实表面点的世界坐标。
+    /// 原理：深度图给出"这个像素离相机多远"，相机内参给出"这个像素的光线方向"，
+    /// 两者相乘即是物体表面点，完全不依赖平面检测。
+    private func depthHitTransform(at screenPoint: CGPoint, frame: ARFrame, view: ARView) -> simd_float4x4? {
+        guard let depthMap = frame.sceneDepth?.depthMap else {
+            diagMessage = "🎯 sceneDepth为空"
+            return nil
+        }
         let viewSize = view.bounds.size
         guard viewSize.width > 0, viewSize.height > 0 else { return nil }
 
         // 屏幕归一化坐标 → 相机图像归一化坐标
         let toCapture = frame.displayTransform(for: .portrait, viewportSize: viewSize).inverted()
         let n = CGPoint(x: screenPoint.x / viewSize.width, y: screenPoint.y / viewSize.height)
-        let c = n.applying(toCapture)
+        var c = n.applying(toCapture)
 
+        // 读深度（3x3 中值抗噪）；主坐标无效时尝试 y 翻转
+        if readDepth(c, depthMap) == nil {
+            c.y = 1 - c.y
+        }
+        guard let depth = readDepth(c, depthMap) else {
+            diagMessage = "🎯 该处无有效深度"
+            return nil
+        }
+
+        // 相机内参反投影：图像像素 → 相机空间方向
+        let intr = frame.camera.intrinsics          // [fx,0,0; 0,fy,0; cx,cy,1]
+        let res = frame.camera.imageResolution
+        let px = Float(c.x) * Float(res.width)
+        let py = Float(c.y) * Float(res.height)
+        let dirCam = SIMD3<Float>(
+            (px - intr[2][0]) / intr[0][0],
+            -(py - intr[2][1]) / intr[1][1],        // 图像 y 向下、相机 y 向上
+            1
+        )
+        let camT = frame.camera.transform
+        let dirW = camT * SIMD4<Float>(dirCam.x, dirCam.y, dirCam.z, 0)
+        let dir = normalize(SIMD3<Float>(dirW.x, dirW.y, dirW.z))
+        let cam = camT.columns.3
+        let p = SIMD3<Float>(cam.x, cam.y, cam.z) + dir * depth
+
+        diagMessage = "🎯 深度\(String(format: "%.2f", depth))m 表面命中"
+
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
+        return t
+    }
+
+    /// 读图像归一化坐标 (nx, ny) 附近的 LiDAR 深度（3x3 抽样取中值，单位米）
+    private func readDepth(_ c: CGPoint, _ depthMap: CVPixelBuffer) -> Float? {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
 
@@ -151,26 +176,21 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         guard let base = CVPixelBufferGetBaseAddressOfPlane(depthMap, 0) else { return nil }
         let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(depthMap, 0)
 
-        func depthAt(_ nx: CGFloat, _ ny: CGFloat) -> Float? {
-            let x = Int(nx * CGFloat(w)), y = Int(ny * CGFloat(h))
-            guard x >= 1, y >= 1, x < w - 1, y < h - 1 else { return nil }
-            var values: [Float] = []
-            for dy in [-1, 0, 1] {
-                for dx in [-1, 0, 1] {
-                    let px = x + dx, py = y + dy
-                    let raw = base.advanced(by: py * rowBytes + px * MemoryLayout<UInt16>.stride)
-                        .assumingMemoryBound(to: UInt16.self).pointee
-                    let f = Float(Float16(bitPattern: raw))
-                    if f.isFinite, f > 0.05, f < 8 { values.append(f) }
-                }
+        let x = Int(c.x * CGFloat(w)), y = Int(c.y * CGFloat(h))
+        guard x >= 1, y >= 1, x < w - 1, y < h - 1 else { return nil }
+        var values: [Float] = []
+        for dy in [-1, 0, 1] {
+            for dx in [-1, 0, 1] {
+                let px = x + dx, py = y + dy
+                let raw = base.advanced(by: py * rowBytes + px * MemoryLayout<UInt16>.stride)
+                    .assumingMemoryBound(to: UInt16.self).pointee
+                let f = Float(Float16(bitPattern: raw))
+                if f.isFinite, f > 0.05, f < 8 { values.append(f) }
             }
-            guard !values.isEmpty else { return nil }
-            values.sort()
-            return values[values.count / 2]
         }
-
-        // 正常坐标优先；若与预期严重不符，尝试 y 翻转后重读
-        return depthAt(c.x, c.y) ?? depthAt(c.x, 1 - c.y)
+        guard !values.isEmpty else { return nil }
+        values.sort()
+        return values[values.count / 2]
     }
 
     @MainActor private func addPoint(worldTransform: simd_float4x4) {

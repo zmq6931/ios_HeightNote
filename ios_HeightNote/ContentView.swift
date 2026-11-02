@@ -177,6 +177,13 @@ struct ContentView: View {
                     .padding(.vertical, 8)
                     .background(.ultraThinMaterial, in: Capsule())
             }
+            if let diag = manager.diagMessage {
+                Text(diag)
+                    .font(.caption2.monospacedDigit())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(.ultraThinMaterial, in: Capsule())
+            }
             Spacer()
             controlPanel
         }
