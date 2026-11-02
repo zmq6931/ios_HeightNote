@@ -74,7 +74,11 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         guard let view = arView else { return }
         let config = ARWorldTrackingConfiguration()
         config.planeDetection = [.horizontal, .vertical]
-        // LiDAR 深度：用于把点击点精确贴到真实物体表面
+        // 场景重建：LiDAR 实时构建环境三维网格，点击时对网格求交（最准的表面命中）
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
+        }
+        // LiDAR 深度：网格未覆盖时的兜底
         if ARWorldTrackingConfiguration.supportsFrameSemantics([.sceneDepth]) {
             config.frameSemantics = [.sceneDepth]
             diagMessage = "🎯 深度语义已设置"
@@ -88,9 +92,9 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     }
 
     /// 点击屏幕 → 记录一个点（或完成导入点的放置）。
-    /// 命中策略：射线方向（官方 raycast，方向必然正确）+ LiDAR 深度（距离）。
-    /// 深度读取会尝试 4 种坐标映射候选，取与射线距离最吻合的那个——无论系统内部
-    /// 坐标约定如何都能拿到正确表面的深度，从根本上避免"穿透"和"点错位"。
+    /// 命中优先级：① 场景重建网格求交（最准，直接命中真实表面几何）
+    /// ② 射线方向 + LiDAR 深度择优（网格未覆盖时）
+    /// ③ 纯深度反投影（非平面悬空物）→ 都不行提示未命中
     @MainActor func handleTap(at screenPoint: CGPoint) {
         guard let view = arView, let frame = view.session.currentFrame else { return }
         let viewSize = view.bounds.size
@@ -98,6 +102,17 @@ final class MeasureSessionManager: NSObject, ObservableObject {
 
         let cam = frame.camera.transform.columns.3
         let camXYZ = SIMD3<Float>(cam.x, cam.y, cam.z)
+
+        // ① 网格求交
+        if let dir = screenRayDirection(screenPoint, frame: frame, view: view),
+           let meshHit = nearestMeshHit(origin: camXYZ, direction: dir, frame: frame) {
+            // 沿视线方向退 1.5cm，避免小球和重建网格贴面闪烁
+            let p = meshHit.point - dir * 0.015
+            place(at: translationMatrix(p))
+            diagMessage = "🎯 网格\(String(format: "%.2f", meshHit.distance))m"
+            return
+        }
+
         let rayResult = raycast(in: view, at: screenPoint)
 
         // 图像归一化坐标（供深度读取用）
@@ -130,11 +145,9 @@ final class MeasureSessionManager: NSObject, ObservableObject {
                 if let best = candidates.min(by: { abs($0 - rayDist) < abs($1 - rayDist) }),
                    abs(best - rayDist) < 1.2 {
                     let dir = (hitXYZ - camXYZ) / rayDist
-                    let surface = camXYZ + dir * best
-                    var t = matrix_identity_float4x4
-                    t.columns.3 = SIMD4<Float>(surface.x, surface.y, surface.z, 1)
-                    transform = t
-                    diagMessage = "🎯 表面\(String(format: "%.2f", best))m(平面\(String(format: "%.2f", rayDist)))"
+                    let surface = camXYZ + dir * (best - 0.015)
+                    transform = translationMatrix(surface)
+                    diagMessage = "🎯 表面\(String(format: "%.2f", best))m(网格未覆盖)"
                 } else {
                     diagMessage = "🎯 平面\(String(format: "%.2f", rayDist))m"
                 }
@@ -152,12 +165,139 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             return
         }
 
+        place(at: hitTransform)
+    }
+
+    @MainActor private func place(at transform: simd_float4x4) {
         if let pending = pendingPlacement {
             pendingPlacement = nil
-            placeImported(pending, at: hitTransform)
+            placeImported(pending, at: transform)
         } else {
-            addPoint(worldTransform: hitTransform)
+            addPoint(worldTransform: transform)
         }
+    }
+
+    private func translationMatrix(_ p: SIMD3<Float>) -> simd_float4x4 {
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
+        return t
+    }
+
+    /// 屏幕点击位置对应的世界空间射线方向。
+    /// 优先用官方 raycast 命中点反推（方向必然正确）；未命中时用相机内参反投影。
+    private func screenRayDirection(_ screenPoint: CGPoint, frame: ARFrame, view: ARView) -> SIMD3<Float>? {
+        let cam = frame.camera.transform.columns.3
+        let camXYZ = SIMD3<Float>(cam.x, cam.y, cam.z)
+        if let r = raycast(in: view, at: screenPoint) {
+            let h = r.worldTransform.columns.3
+            let d = SIMD3<Float>(h.x - cam.x, h.y - cam.y, h.z - cam.z)
+            let len = simd_length(d)
+            if len > 0.001 { return d / len }
+        }
+        guard view.bounds.width > 0, view.bounds.height > 0 else { return nil }
+        let toCapture = frame.displayTransform(for: .portrait, viewportSize: view.bounds.size).inverted()
+        let n = CGPoint(x: screenPoint.x / view.bounds.width, y: screenPoint.y / view.bounds.height)
+        let c = n.applying(toCapture)
+        let intr = frame.camera.intrinsics
+        let res = frame.camera.imageResolution
+        let px = Float(c.x) * Float(res.width)
+        let py = Float(c.y) * Float(res.height)
+        let dirCam = SIMD3<Float>(
+            (px - intr[2][0]) / intr[0][0],
+            -(py - intr[2][1]) / intr[1][1],
+            1
+        )
+        let dirW = frame.camera.transform * SIMD4<Float>(dirCam.x, dirCam.y, dirCam.z, 0)
+        return normalize(SIMD3<Float>(dirW.x, dirW.y, dirW.z))
+    }
+
+    // MARK: - 场景重建网格求交
+
+    struct MeshHit {
+        var point: SIMD3<Float>
+        var distance: Float
+    }
+
+    /// 射线对当前帧所有重建网格（ARMeshAnchor）求交，返回最近命中。
+    /// 把射线变换到每个网格的局部空间做 Möller–Trumbore 三角形求交。
+    private func nearestMeshHit(origin: SIMD3<Float>, direction: SIMD3<Float>, frame: ARFrame) -> MeshHit? {
+        let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+        guard !meshAnchors.isEmpty else { return nil }
+
+        var best: MeshHit?
+
+        for anchor in meshAnchors {
+            // 粗筛：网格块中心离相机太远的跳过
+            let ap = anchor.transform.columns.3
+            if simd_distance(origin, SIMD3<Float>(ap.x, ap.y, ap.z)) > 10 { continue }
+
+            let geo = anchor.geometry
+            let vCount = geo.vertices.count
+            let fCount = geo.faces.count
+            guard vCount >= 3, fCount > 0 else { continue }
+            let vStride = geo.vertices.stride
+            let indexBytes = geo.faces.bytesPerIndex
+            let perPrim = geo.faces.indexCountPerPrimitive
+            guard perPrim == 3, indexBytes == 4 || indexBytes == 2 else { continue }
+            let vBuf = geo.vertices.buffer.contents()
+            let fBuf = geo.faces.buffer.contents()
+
+            // 射线变换到网格局部空间
+            let inv = anchor.transform.inverse
+            let lo4 = inv * SIMD4<Float>(origin.x, origin.y, origin.z, 1)
+            let ld4 = inv * SIMD4<Float>(direction.x, direction.y, direction.z, 0)
+            let lo = SIMD3<Float>(lo4.x, lo4.y, lo4.z)
+            let ld = normalize(SIMD3<Float>(ld4.x, ld4.y, ld4.z))
+
+            func index(_ n: Int) -> Int {
+                if indexBytes == 4 {
+                    return Int(fBuf.load(fromByteOffset: n * 4, as: UInt32.self))
+                }
+                return Int(fBuf.load(fromByteOffset: n * 2, as: UInt16.self))
+            }
+
+            for f in 0..<fCount {
+                let base = f * 3
+                let i0 = index(base)
+                let i1 = index(base + 1)
+                let i2 = index(base + 2)
+                guard i0 < vCount, i1 < vCount, i2 < vCount else { continue }
+
+                let v0 = vBuf.load(fromByteOffset: i0 * vStride, as: SIMD3<Float>.self)
+                let v1 = vBuf.load(fromByteOffset: i1 * vStride, as: SIMD3<Float>.self)
+                let v2 = vBuf.load(fromByteOffset: i2 * vStride, as: SIMD3<Float>.self)
+
+                if let t = rayTriangle(lo, ld, v0, v1, v2), t > 0.05 {
+                    let pLocal = lo + ld * t
+                    let w4 = anchor.transform * SIMD4<Float>(pLocal.x, pLocal.y, pLocal.z, 1)
+                    let w = SIMD3<Float>(w4.x, w4.y, w4.z)
+                    let dist = simd_distance(origin, w)
+                    if dist < (best?.distance ?? .greatestFiniteMagnitude) {
+                        best = MeshHit(point: w, distance: dist)
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    /// Möller–Trumbore 射线-三角形求交，命中返回沿射线的距离 t
+    private func rayTriangle(_ o: SIMD3<Float>, _ d: SIMD3<Float>,
+                             _ v0: SIMD3<Float>, _ v1: SIMD3<Float>, _ v2: SIMD3<Float>) -> Float? {
+        let e1 = v1 - v0
+        let e2 = v2 - v0
+        let p = cross(d, e2)
+        let det = dot(e1, p)
+        if abs(det) < 1e-9 { return nil }
+        let invDet = 1 / det
+        let t0 = o - v0
+        let u = dot(t0, p) * invDet
+        if u < 0 || u > 1 { return nil }
+        let q = cross(t0, e1)
+        let v = dot(d, q) * invDet
+        if v < 0 || u + v > 1 { return nil }
+        let t = dot(e2, q) * invDet
+        return t > 0 ? t : nil
     }
 
     /// 纯深度反投影（raycast 未命中时的兜底）：像素方向由相机内参反算
