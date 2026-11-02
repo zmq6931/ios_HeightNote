@@ -20,6 +20,7 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     @Published var pendingPlacement: [MarkedPoint]?
     /// 点击诊断信息（临时）：显示射线距离与 LiDAR 深度
     @Published var diagMessage: String?
+    private var depthFailReason = ""
 
     private(set) weak var arView: ARView?
     private var anchors: [UUID: AnchorEntity] = [:]
@@ -77,6 +78,12 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         // LiDAR 深度：用于把点击点精确贴到真实物体表面
         if ARWorldTrackingConfiguration.supportsFrameSemantics([.sceneDepth]) {
             config.frameSemantics = [.sceneDepth]
+            diagMessage = "🎯 深度语义已设置"
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics([.smoothedSceneDepth]) {
+            config.frameSemantics = [.smoothedSceneDepth]
+            diagMessage = "🎯 平滑深度已设置"
+        } else {
+            diagMessage = "🎯 深度不支持"
         }
         view.session.run(config)
     }
@@ -95,7 +102,7 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             diagMessage = "🎯 无深度，用平面"
         } else {
             missNotice = Date()
-            diagMessage = "🎯 未命中"
+            diagMessage = "🎯 未命中·\(depthFailReason.isEmpty ? "无深度" : depthFailReason)·平面也没中"
             return
         }
 
@@ -123,6 +130,7 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     /// 两者相乘即是物体表面点，完全不依赖平面检测。
     private func depthHitTransform(at screenPoint: CGPoint, frame: ARFrame, view: ARView) -> simd_float4x4? {
         guard let depthMap = frame.sceneDepth?.depthMap else {
+            depthFailReason = "深度未开启"
             diagMessage = "🎯 sceneDepth为空"
             return nil
         }
@@ -139,7 +147,8 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             c.y = 1 - c.y
         }
         guard let depth = readDepth(c, depthMap) else {
-            diagMessage = "🎯 该处无有效深度"
+            depthFailReason = "该处无深度"
+            diagMessage = "🎯 该处无有效深度 c=(\(String(format: "%.2f", c.x)),\(String(format: "%.2f", c.y)))"
             return nil
         }
 
