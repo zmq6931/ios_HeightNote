@@ -249,6 +249,16 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             let lo = SIMD3<Float>(lo4.x, lo4.y, lo4.z)
             let ld = normalize(SIMD3<Float>(ld4.x, ld4.y, ld4.z))
 
+            // 包围盒预筛：射线不经过这个网格块就跳过（全屋三角形太多，必须筛）
+            var mn = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+            var mx = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+            for i in 0..<vCount {
+                let v = vBuf.loadUnaligned(fromByteOffset: i * vStride, as: SIMD3<Float>.self)
+                mn = simd_min(mn, v)
+                mx = simd_max(mx, v)
+            }
+            guard rayIntersectsAABB(lo, ld, mn, mx) else { continue }
+
             func index(_ n: Int) -> Int {
                 if indexBytes == 4 {
                     return Int(fBuf.load(fromByteOffset: n * 4, as: UInt32.self))
@@ -263,9 +273,10 @@ final class MeasureSessionManager: NSObject, ObservableObject {
                 let i2 = index(base + 2)
                 guard i0 < vCount, i1 < vCount, i2 < vCount else { continue }
 
-                let v0 = vBuf.load(fromByteOffset: i0 * vStride, as: SIMD3<Float>.self)
-                let v1 = vBuf.load(fromByteOffset: i1 * vStride, as: SIMD3<Float>.self)
-                let v2 = vBuf.load(fromByteOffset: i2 * vStride, as: SIMD3<Float>.self)
+                // 网格顶点是紧凑排列（12 字节/个），必须用非对齐读取，否则崩溃
+                let v0 = vBuf.loadUnaligned(fromByteOffset: i0 * vStride, as: SIMD3<Float>.self)
+                let v1 = vBuf.loadUnaligned(fromByteOffset: i1 * vStride, as: SIMD3<Float>.self)
+                let v2 = vBuf.loadUnaligned(fromByteOffset: i2 * vStride, as: SIMD3<Float>.self)
 
                 if let t = rayTriangle(lo, ld, v0, v1, v2), t > 0.05 {
                     let pLocal = lo + ld * t
@@ -298,6 +309,23 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         if v < 0 || u + v > 1 { return nil }
         let t = dot(e2, q) * invDet
         return t > 0 ? t : nil
+    }
+
+    /// slab 法射线-AABB 相交测试
+    private func rayIntersectsAABB(_ o: SIMD3<Float>, _ d: SIMD3<Float>,
+                                    _ mn: SIMD3<Float>, _ mx: SIMD3<Float>) -> Bool {
+        var tmin: Float = 0
+        var tmax: Float = .greatestFiniteMagnitude
+        for i in 0..<3 {
+            let invD = 1 / d[i]
+            var t1 = (mn[i] - o[i]) * invD
+            var t2 = (mx[i] - o[i]) * invD
+            if t1 > t2 { swap(&t1, &t2) }
+            tmin = max(tmin, t1)
+            tmax = min(tmax, t2)
+            if tmin > tmax { return false }
+        }
+        return true
     }
 
     /// 纯深度反投影（raycast 未命中时的兜底）：像素方向由相机内参反算
