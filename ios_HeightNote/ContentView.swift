@@ -228,6 +228,10 @@ struct ContentView: View {
                 step("4", "点选任意两个点算高度差，随时保存或导出 Excel")
             }
             .font(.subheadline)
+            Label("请勿在手机用数据线连接电脑时使用：iOS 系统缺陷会导致相机画面中断，且需重启手机才能恢复", systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
         }
         .frame(maxWidth: .infinity)
     }
