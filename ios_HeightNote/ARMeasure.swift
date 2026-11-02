@@ -20,7 +20,6 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     @Published var pendingPlacement: [MarkedPoint]?
     /// 点击诊断信息（临时）：显示射线距离与 LiDAR 深度
     @Published var diagMessage: String?
-    private var depthFailReason = ""
 
     private(set) weak var arView: ARView?
     private var anchors: [UUID: AnchorEntity] = [:]
@@ -89,20 +88,67 @@ final class MeasureSessionManager: NSObject, ObservableObject {
     }
 
     /// 点击屏幕 → 记录一个点（或完成导入点的放置）。
-    /// 优先用 LiDAR 深度反投影：点直接落在点击像素的真实物体表面（含非平面物体）；
-    /// 读不到深度时退回平面 raycast。
+    /// 命中策略：射线方向（官方 raycast，方向必然正确）+ LiDAR 深度（距离）。
+    /// 深度读取会尝试 4 种坐标映射候选，取与射线距离最吻合的那个——无论系统内部
+    /// 坐标约定如何都能拿到正确表面的深度，从根本上避免"穿透"和"点错位"。
     @MainActor func handleTap(at screenPoint: CGPoint) {
         guard let view = arView, let frame = view.session.currentFrame else { return }
+        let viewSize = view.bounds.size
+        guard viewSize.width > 0, viewSize.height > 0 else { return }
+
+        let cam = frame.camera.transform.columns.3
+        let camXYZ = SIMD3<Float>(cam.x, cam.y, cam.z)
+        let rayResult = raycast(in: view, at: screenPoint)
+
+        // 图像归一化坐标（供深度读取用）
+        var captureCoord: CGPoint?
+        var depthMap: CVPixelBuffer?
+        if let dm = frame.sceneDepth?.depthMap {
+            depthMap = dm
+            let toCapture = frame.displayTransform(for: .portrait, viewportSize: viewSize).inverted()
+            let n = CGPoint(x: screenPoint.x / viewSize.width, y: screenPoint.y / viewSize.height)
+            captureCoord = n.applying(toCapture)
+        }
 
         let hitTransform: simd_float4x4
-        if let depthHit = depthHitTransform(at: screenPoint, frame: frame, view: view) {
-            hitTransform = depthHit
-        } else if let result = raycast(in: view, at: screenPoint) {
-            hitTransform = result.worldTransform
-            diagMessage = "🎯 无深度，用平面"
+
+        if let result = rayResult {
+            var transform = result.worldTransform
+            let hit = result.worldTransform.columns.3
+            let hitXYZ = SIMD3<Float>(hit.x, hit.y, hit.z)
+            let rayDist = simd_distance(camXYZ, hitXYZ)
+
+            if let c = captureCoord, let map = depthMap {
+                // 4 种映射候选，取与射线距离最接近的深度
+                let candidates = [
+                    CGPoint(x: c.x, y: c.y),
+                    CGPoint(x: 1 - c.x, y: c.y),
+                    CGPoint(x: c.x, y: 1 - c.y),
+                    CGPoint(x: 1 - c.x, y: 1 - c.y),
+                ].compactMap { readDepth($0, map) }
+
+                if let best = candidates.min(by: { abs($0 - rayDist) < abs($1 - rayDist) }),
+                   abs(best - rayDist) < 1.2 {
+                    let dir = (hitXYZ - camXYZ) / rayDist
+                    let surface = camXYZ + dir * best
+                    var t = matrix_identity_float4x4
+                    t.columns.3 = SIMD4<Float>(surface.x, surface.y, surface.z, 1)
+                    transform = t
+                    diagMessage = "🎯 表面\(String(format: "%.2f", best))m(平面\(String(format: "%.2f", rayDist)))"
+                } else {
+                    diagMessage = "🎯 平面\(String(format: "%.2f", rayDist))m"
+                }
+            } else {
+                diagMessage = "🎯 平面\(String(format: "%.2f", simd_distance(camXYZ, SIMD3<Float>(hit.x, hit.y, hit.z))))m 无深度"
+            }
+            hitTransform = transform
+        } else if let c = captureCoord, let map = depthMap,
+                  let t = backProjectionTransform(c, depthMap: map, frame: frame) {
+            // 射线没命中（非平面物体悬空等场景）：纯深度反投影
+            hitTransform = t
         } else {
             missNotice = Date()
-            diagMessage = "🎯 未命中·\(depthFailReason.isEmpty ? "无深度" : depthFailReason)·平面也没中"
+            diagMessage = "🎯 未命中·\(frame.sceneDepth == nil ? "深度未开启" : "无有效深度")·平面没中"
             return
         }
 
@@ -114,6 +160,30 @@ final class MeasureSessionManager: NSObject, ObservableObject {
         }
     }
 
+    /// 纯深度反投影（raycast 未命中时的兜底）：像素方向由相机内参反算
+    private func backProjectionTransform(_ c: CGPoint, depthMap: CVPixelBuffer, frame: ARFrame) -> simd_float4x4? {
+        guard let depth = readDepth(c, depthMap) ?? readDepth(CGPoint(x: c.x, y: 1 - c.y), depthMap)
+        else { return nil }
+        let intr = frame.camera.intrinsics
+        let res = frame.camera.imageResolution
+        let px = Float(c.x) * Float(res.width)
+        let py = Float(c.y) * Float(res.height)
+        let dirCam = SIMD3<Float>(
+            (px - intr[2][0]) / intr[0][0],
+            -(py - intr[2][1]) / intr[1][1],
+            1
+        )
+        let camT = frame.camera.transform
+        let dirW = camT * SIMD4<Float>(dirCam.x, dirCam.y, dirCam.z, 0)
+        let dir = normalize(SIMD3<Float>(dirW.x, dirW.y, dirW.z))
+        let cam = camT.columns.3
+        let p = SIMD3<Float>(cam.x, cam.y, cam.z) + dir * depth
+        diagMessage = "🎯 反投影\(String(format: "%.2f", depth))m"
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
+        return t
+    }
+
     /// 已识别平面（含范围）→ 估算平面。
     /// 不用 existingPlaneInfinite：平面无限延伸会让点"穿过"近处物体落在背景上。
     private func raycast(in view: ARView, at point: CGPoint) -> ARRaycastResult? {
@@ -123,56 +193,6 @@ final class MeasureSessionManager: NSObject, ObservableObject {
             }
         }
         return nil
-    }
-
-    /// LiDAR 深度反投影：点击像素 → 该像素处真实表面点的世界坐标。
-    /// 原理：深度图给出"这个像素离相机多远"，相机内参给出"这个像素的光线方向"，
-    /// 两者相乘即是物体表面点，完全不依赖平面检测。
-    private func depthHitTransform(at screenPoint: CGPoint, frame: ARFrame, view: ARView) -> simd_float4x4? {
-        guard let depthMap = frame.sceneDepth?.depthMap else {
-            depthFailReason = "深度未开启"
-            diagMessage = "🎯 sceneDepth为空"
-            return nil
-        }
-        let viewSize = view.bounds.size
-        guard viewSize.width > 0, viewSize.height > 0 else { return nil }
-
-        // 屏幕归一化坐标 → 相机图像归一化坐标
-        let toCapture = frame.displayTransform(for: .portrait, viewportSize: viewSize).inverted()
-        let n = CGPoint(x: screenPoint.x / viewSize.width, y: screenPoint.y / viewSize.height)
-        var c = n.applying(toCapture)
-
-        // 读深度（3x3 中值抗噪）；主坐标无效时尝试 y 翻转
-        if readDepth(c, depthMap) == nil {
-            c.y = 1 - c.y
-        }
-        guard let depth = readDepth(c, depthMap) else {
-            depthFailReason = "该处无深度"
-            diagMessage = "🎯 该处无有效深度 c=(\(String(format: "%.2f", c.x)),\(String(format: "%.2f", c.y)))"
-            return nil
-        }
-
-        // 相机内参反投影：图像像素 → 相机空间方向
-        let intr = frame.camera.intrinsics          // [fx,0,0; 0,fy,0; cx,cy,1]
-        let res = frame.camera.imageResolution
-        let px = Float(c.x) * Float(res.width)
-        let py = Float(c.y) * Float(res.height)
-        let dirCam = SIMD3<Float>(
-            (px - intr[2][0]) / intr[0][0],
-            -(py - intr[2][1]) / intr[1][1],        // 图像 y 向下、相机 y 向上
-            1
-        )
-        let camT = frame.camera.transform
-        let dirW = camT * SIMD4<Float>(dirCam.x, dirCam.y, dirCam.z, 0)
-        let dir = normalize(SIMD3<Float>(dirW.x, dirW.y, dirW.z))
-        let cam = camT.columns.3
-        let p = SIMD3<Float>(cam.x, cam.y, cam.z) + dir * depth
-
-        diagMessage = "🎯 深度\(String(format: "%.2f", depth))m 表面命中"
-
-        var t = matrix_identity_float4x4
-        t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
-        return t
     }
 
     /// 读图像归一化坐标 (nx, ny) 附近的 LiDAR 深度（3x3 抽样取中值，单位米）
